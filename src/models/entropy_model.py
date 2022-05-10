@@ -74,32 +74,22 @@ class EntropyBottleneck(nn.Module):
         filters = (1,) + self._filters + (1,)
         scale = self._init_scale ** (1 / (len(self._filters) + 1))
         # Create variables.
-        self._matrices = nn.ParameterList([])
-        self._biases = nn.ParameterList([])
-        self._factors = nn.ParameterList([])
+        # self._matrices = nn.ParameterList([])
+        # self._biases = nn.ParameterList([])
+        # self._factors = nn.ParameterList([])
 
         for i in range(len(self._filters) + 1):
-            self.matrix = Parameter(
-                torch.FloatTensor(channels, filters[i + 1], filters[i])
-            )
+            self.matrix = Parameter(torch.FloatTensor(channels, filters[i + 1], filters[i]))
             init_matrix = np.log(np.expm1(1.0 / scale / filters[i + 1]))
             self.matrix.data.fill_(init_matrix)
-            self._matrices.append(self.matrix)
-            #
-            self.bias = Parameter(
-                torch.FloatTensor(channels, filters[i + 1], 1)
-            )
-            init_bias = torch.FloatTensor(
-                np.random.uniform(-0.5, 0.5, self.bias.size())
-            )
+            self.register_parameter('matrix_{}'.format(i), self.matrix)
+            self.bias = Parameter(torch.FloatTensor(channels, filters[i + 1], 1))
+            init_bias = torch.FloatTensor(np.random.uniform(-0.5, 0.5, self.bias.size()))
             self.bias.data.copy_(init_bias)
-            self._biases.append(self.bias)
-            #
-            self.factor = Parameter(
-                torch.FloatTensor(channels, filters[i + 1], 1)
-            )
+            self.register_parameter('bias_{}'.format(i), self.bias)
+            self.factor = Parameter(torch.FloatTensor(channels, filters[i + 1], 1))
             self.factor.data.fill_(0.0)
-            self._factors.append(self.factor)
+            self.register_parameter('factor_{}'.format(i), self.factor)
 
     def _logits_cumulative(self, inputs: torch.Tensor):
         """Evaluate logits of the cumulative densities.
@@ -114,10 +104,10 @@ class EntropyBottleneck(nn.Module):
         """
         logits = inputs
         for i in range(len(self._filters) + 1):
-            matrix = torch.nn.functional.softplus(self._matrices[i])
+            matrix = torch.nn.functional.softplus(eval('self.matrix_{}'.format(i)))
             logits = torch.matmul(matrix, logits)
-            logits += self._biases[i]
-            factor = torch.tanh(self._factors[i])
+            logits += eval('self.bias_{}'.format(i))
+            factor = torch.tanh(eval('self.factor_{}'.format(i)))
             logits += factor * torch.tanh(logits)
 
         return logits

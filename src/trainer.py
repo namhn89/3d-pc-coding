@@ -17,6 +17,7 @@ from dataprocess.inout_points import select_voxels
 from loss import get_bce_loss
 from loss import get_classify_metrics
 from pcc_model import PCCModel
+from torch.utils.tensorboard import SummaryWriter
 from utils.file_util import read_yaml
 from utils.general import init_log
 from utils.log import init_torch_seeds
@@ -43,8 +44,12 @@ class Trainer:
 
     def prepare(self):
         self.checkpoint_dir = self.exp_dir.joinpath('checkpoint')
-        shutil.rmtree(self.checkpoint_dir)  # Delete old checkpoint folder
+        self.tensorboard_dir = self.exp_dir.joinpath('tensorboard')
+        shutil.rmtree(self.tensorboard_dir, ignore_errors=True)
+        shutil.rmtree(self.checkpoint_dir, ignore_errors=True)  # Delete old checkpoint folder
         self.checkpoint_dir.mkdir(exist_ok=True)
+        self.tensorboard_dir.mkdir(exist_ok=True)
+        self.writer = SummaryWriter(self.tensorboard_dir)
         self.load_state_dict()
         logger.info(self.network)
         self.optimizer = self.set_optimizer()
@@ -56,25 +61,25 @@ class Trainer:
         return
 
     def set_optimizer(self):
-        params_lr_list = []
-        for module_name in self.network._modules.keys():
-            logger.info("module_name: {}".format(module_name))
-            params_lr_list.append(
-                {
-                    "params": self.network._modules[module_name].parameters(),
-                    'lr': self.config['lr']
-                }
-            )
-        optimizer = torch.optim.Adam(params_lr_list, betas=(0.9, 0.999), weight_decay=1e-4)
-        # optimizer = torch.optim.Adam(
-        #     self.network.parameters(),
-        #     lr=self.config['lr'],
-        #     betas=(0.9, 0.999),
-        #     weight_decay=1e-4
-        # )
+        optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.config['lr'],
+            betas=(0.9, 0.999),
+            weight_decay=1e-4
+        )
+        # params_lr_list = []
+        # for module_name in self.network._modules.keys():
+        #     logger.info("module_name: {}".format(module_name))
+        #     params_lr_list.append(
+        #         {
+        #             "params": self.network._modules[module_name].parameters(),
+        #             'lr': self.config['lr']
+        #         }
+        #     )
+        # optimizer = torch.optim.Adam(params_lr_list, betas=(0.9, 0.999), weight_decay=1e-4)
 
         if self.config["init_checkpoint"] != '':
-            ckpt = torch.load(self.config['init_checkpoint'])
+            ckpt = torch.load(self.config['init_checkpoint'], map_location=self.device)
             if 'optimizer' in ckpt.keys():
                 optimizer.load_state_dict(ckpt['optimizer'])
                 for param_group in optimizer.param_groups:
@@ -86,8 +91,11 @@ class Trainer:
         if self.config["init_checkpoint"] == '':
             logger.info('Random initialization.')
         else:
-            checkpoint = torch.load(self.config["init_checkpoint"])
-            self.network.load_state_dict(checkpoint['model'])
+            checkpoint = torch.load(self.config['init_checkpoint'], map_location=self.device)
+            if isinstance(self.network, torch.nn.DataParallel):
+                self.network.module.load_state_dict(checkpoint['model'])
+            else:
+                self.network.load_state_dict(checkpoint['model'])
             logger.info('Load checkpoint from ' + self.config["init_checkpoint"])
 
     def save_checkpoint(self, filename):
@@ -97,7 +105,6 @@ class Trainer:
         logger.info('Saving model at {}'.format(str(save_dir)))
 
     def train(self, dataloader):
-        # logger.info('=' * 40 + '\n' + 'Training Epoch: ' + str(self.current_epoch))
         logger.info('alpha: ' + str(round(self.config['alpha'], 2)) + '\tbeta: ' + str(round(self.config['beta'], 2)))
         logger.info('learning rate: ' + str([params['lr'] for params in self.optimizer.param_groups]))
         logger.info('Training Files length: ' + str(len(dataloader)))
@@ -111,7 +118,7 @@ class Trainer:
             self.optimizer.zero_grad()
             # Data
             x_np = points2voxels(points, 64).astype('float32')
-            x_cpu = torch.from_numpy(x_np).permute(0, 4, 1, 2, 3)  # (8, 64, 64, 64, 1)-> (8, 1, 64, 64, 64)
+            x_cpu = torch.from_numpy(x_np).permute(0, 4, 1, 2, 3)  # (8, 64, 64, 64, 1) -> (8, 1, 64, 64, 64)
 
             x = x_cpu.to(self.device)
             # Forward
@@ -131,12 +138,13 @@ class Trainer:
             # Backward & Optimize
             train_loss.backward()
             self.optimizer.step()
-
+            global_step = self.current_epoch * len(dataloader) + batch_step + 1
             if (batch_step + 1) % self.config['DISPLAY_STEP'] == 0:
                 logger.info('Train_zeros: ' + str(train_zeros.item()))
                 logger.info('Train_ones: ' + str(train_ones.item()))
                 logger.info('Train_distortion: ' + str(train_distortion.item()))
                 logger.info('Train_loss: ' + str(train_loss.item()))
+                self.writer.add_scalar('Train_loss', train_loss.item(), global_step)
 
             del train_loss
 
@@ -160,11 +168,16 @@ class Trainer:
                     train_IoU_sum /= num
                     train_bpp = train_bpp_ae_sum + train_bpp_hyper_sum
 
-                    logger.info("Iteration {0:}:".format(batch_step))
+                    logger.info("Iteration {0:}:".format(global_step))
                     logger.info("Bpps (AE): {0:.4f}".format(train_bpp_ae_sum))
                     logger.info("Bpps (Hyper): {0:.4f}".format(train_bpp_hyper_sum))
                     logger.info("Bpps (All): {0:.4f}".format(train_bpp))
                     logger.info("IoU: {0:.4f}".format(train_IoU_sum))
+
+                    self.writer.add_scalar('Train/bpps_ae', train_bpp_ae_sum, global_step)
+                    self.writer.add_scalar('Train/bpps_hyper', train_bpp_hyper_sum, global_step)
+                    self.writer.add_scalar('Train/bpps', train_bpp, global_step)
+                    self.writer.add_scalar('Train/IoU', train_IoU_sum, global_step)
 
                     # record
                     # self.record_set['bpp_ae'].append(train_bpp_ae_sum)
@@ -179,7 +192,7 @@ class Trainer:
                     train_IoU_sum = 0.
                     train_bpp = 0.
 
-                global_step = self.current_epoch * len(dataloader) + batch_step + 1
+                # global_step = self.current_epoch * len(dataloader) + batch_step + 1
                 # Save checkpoints.
                 if global_step % self.config['SAVE_STEP'] == 0:
                     # logger.info('Iteration ' + str(global_step) + " save model!")
@@ -199,7 +212,7 @@ class Trainer:
         for _, points in enumerate(tqdm.tqdm(dataloader)):
             # Data
             x_np = points2voxels(points, 64).astype('float32')
-            x_cpu = torch.from_numpy(x_np).permute(0, 4, 1, 2, 3)  # (8, 64, 64, 64, 1)->(8, 1, 64, 64, 64)
+            x_cpu = torch.from_numpy(x_np).permute(0, 4, 1, 2, 3)  # (8, 64, 64, 64, 1) -> (8, 1, 64, 64, 64)
             x = x_cpu.to(self.device)
             # Forward.
             out_set = self.network(x, training=False)
@@ -229,17 +242,22 @@ class Trainer:
         logger.info("Bpps (All): {0:.4f}".format(bpps))
         logger.info("IoU: {0:.4f}".format(IoUs))
 
+        self.writer.add_scalar('Test/bpps_ae', bpps_ae, self.current_epoch)
+        self.writer.add_scalar('Test/bpps_hyper', bpps_hyper, self.current_epoch)
+        self.writer.add_scalar('Test/bpps', bpps, self.current_epoch)
+        self.writer.add_scalar('Test/IoU', IoUs, self.current_epoch)
+
     def run(self):
         RATIO_EVAL = 9
         self.current_epoch = -1
         filedirs = sorted(glob.glob(self.config['dataset'] + '*.h5'))
         try:
             self.network = self.network.to(self.device)
-
+            self.timer.start('Training Process', verbal=True)
             for _ in range(self.config["epoch"]):
                 self.current_epoch += 1
-                if self.current_epoch > 0:
-                    self.update_lr(lr=max(self.config['lr'] / 2, 1e-5))
+                # if self.current_epoch > 0:
+                #     self.update_lr(lr=max(self.config['lr'] / 2, 1e-5))
 
                 self.timer.start('Epoch {}/{}'.format(self.current_epoch, self.config["epoch"]), verbal=True)
                 random_list = {
@@ -269,6 +287,10 @@ class Trainer:
 
                 self.timer.stop()
 
+            self.timer.stop()
+
         except KeyboardInterrupt:
             logger.info('Training interrupted')
             self.save_checkpoint('final_model.pt')
+
+        self.timer.stop()
